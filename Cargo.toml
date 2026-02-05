@@ -3,6 +3,7 @@ name = "ghostwriter-cli"
 version = "0.1.0"
 edition = "2021"
 
+
 [dependencies]
 rdev = "0.5"
 active-win-pos-rs = "0.8"
@@ -12,3 +13,7 @@ chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1.0"
 ctrlc = "3.4"
 dirs = "5.0"
+tray-icon = "0.19.2"
+tao = { version = "0.30.8", default-features = false, features = [ "rwh_06" ] }
+open = "5.3.2"
+native-dialog = "0.7.0"
