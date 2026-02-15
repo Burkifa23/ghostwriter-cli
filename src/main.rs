@@ -7,12 +7,13 @@ use chrono::Utc;
 use native_dialog::{MessageDialog, MessageType};
 use rdev::{listen, Event, EventType};
 use serde::Serialize;
-use std::fs::{create_dir_all, OpenOptions};
-use std::io::Write;
+use sha2::{Sha256, Digest};
+use std::fs::{create_dir_all, OpenOptions, File};
+use std::io::{Write, BufWriter};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
@@ -21,13 +22,27 @@ use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{TrayIconBuilder, TrayIconEvent};
 
 const BATCH_SIZE: usize = 20;
-const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
+const AUTO_SAVE_INTERVAL: Duration = Duration::from_secs(60);
+const SALT: &str = "GHOSTWRITER_SECURE_SALT_V1";
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct LogEvent {
     timestamp: i64,
     window_title: String,
     event_type: String,
+}
+
+#[derive(Serialize)]
+struct Header {
+    version: String,
+    algorithm: String,
+}
+
+#[derive(Serialize)]
+struct SignedSession {
+    header: Header,
+    payload: Vec<LogEvent>,
+    signature: String,
 }
 
 fn get_session_file_path() -> Result<PathBuf> {
@@ -35,6 +50,23 @@ fn get_session_file_path() -> Result<PathBuf> {
     path.push("Ghostwriter");
     create_dir_all(&path).context("Failed to create Ghostwriter directory")?;
     path.push("session.json");
+    Ok(path)
+}
+
+fn get_session_file_path_timestamped() -> Result<PathBuf> {
+    let mut path = dirs::document_dir().context("Could not find Documents directory")?;
+    path.push("Ghostwriter");
+    create_dir_all(&path).context("Failed to create Ghostwriter directory")?;
+    let filename = format!("Session_{}.gw", Utc::now().timestamp());
+    path.push(filename);
+    Ok(path)
+}
+
+fn get_temp_file_path() -> Result<PathBuf> {
+    let mut path = dirs::document_dir().context("Could not find Documents directory")?;
+    path.push("Ghostwriter");
+    create_dir_all(&path)?;
+    path.push(".ghostwriter.tmp");
     Ok(path)
 }
 
@@ -110,6 +142,7 @@ fn main() -> Result<()> {
 
     // 4. Setup State and Channels
     let is_recording = Arc::new(AtomicBool::new(false)); // Default to NOT recording
+    let shared_buffer = Arc::new(Mutex::new(Vec::new())); // Shared buffer for events
     let (tx, rx) = channel::<i64>();
 
     // 5. Spawn Worker Threads
@@ -136,9 +169,9 @@ fn main() -> Result<()> {
 
     // Thread B: Writer (Processor)
     // Receives timestamps, adds window info, buffers, and writes.
-    let session_path = get_session_file_path()?;
+    let buffer_writer = shared_buffer.clone();
     thread::spawn(move || {
-        process_logs(rx, session_path);
+        process_logs(rx, buffer_writer);
     });
 
     // 6. Run Event Loop (Main Thread)
@@ -158,6 +191,25 @@ fn main() -> Result<()> {
             } else if event.id == stop_item.id() {
                 is_recording.store(false, Ordering::SeqCst);
                 let _ = status_item.set_text("Status: Idle");
+                
+                // Finalize and Seal
+                let buffer_lock = shared_buffer.lock().unwrap();
+                if !buffer_lock.is_empty() {
+                    if let Ok(path) = get_session_file_path_timestamped() {
+                         if let Err(e) = save_signed_session(&buffer_lock, &path) {
+                             eprintln!("Failed to save signed session: {:?}", e);
+                             let _ = MessageDialog::new()
+                                .set_type(MessageType::Error)
+                                .set_title("Save Error")
+                                .set_text(&format!("Failed to save session: {}", e))
+                                .show_alert();
+                         }
+                    }
+                }
+                // Clear the buffer after saving (or even if empty/failed, to reset state)
+                drop(buffer_lock); // Unlock to allow clearing
+                shared_buffer.lock().unwrap().clear();
+                
                 // Optional: Update icon to Red/Default
             } else if event.id == open_folder_item.id() {
                 let path = match get_session_file_path() {
@@ -181,9 +233,9 @@ fn main() -> Result<()> {
     });
 }
 
-fn process_logs(rx: Receiver<i64>, session_path: PathBuf) {
-    let mut buffer: Vec<LogEvent> = Vec::with_capacity(BATCH_SIZE);
-    let mut last_flush = Instant::now();
+fn process_logs(rx: Receiver<i64>, shared_buffer: Arc<Mutex<Vec<LogEvent>>>) {
+    let mut last_auto_save = Instant::now();
+    let temp_path = get_temp_file_path().unwrap_or_else(|_| PathBuf::from(".ghostwriter.tmp"));
 
     loop {
         match rx.recv_timeout(Duration::from_millis(100)) {
@@ -198,43 +250,68 @@ fn process_logs(rx: Receiver<i64>, session_path: PathBuf) {
                     window_title,
                     event_type: "keypress".to_string(),
                 };
+                
+                let mut buffer = shared_buffer.lock().unwrap();
                 buffer.push(event);
             }
             Err(RecvTimeoutError::Timeout) => {
-                // Continue to flush check
+                // Continue to check auto-save
             }
             Err(RecvTimeoutError::Disconnected) => {
-                // Sender closed, exit loop
                 break;
             }
         }
 
-        let should_flush = buffer.len() >= BATCH_SIZE || last_flush.elapsed() >= FLUSH_INTERVAL;
-        if should_flush && !buffer.is_empty() {
-             if let Err(e) = flush_buffer(&buffer, &session_path) {
-                 eprintln!("Failed to flush: {:?}", e);
-             }
-             buffer.clear();
-             last_flush = Instant::now();
+        // Auto-Save / Dump logic
+        if last_auto_save.elapsed() >= AUTO_SAVE_INTERVAL {
+            let buffer = shared_buffer.lock().unwrap();
+            if !buffer.is_empty() {
+                 if let Err(e) = dump_to_temp(&buffer, &temp_path) {
+                     eprintln!("Auto-save failed: {:?}", e);
+                 }
+            }
+            last_auto_save = Instant::now();
         }
-    }
-    
-    // Final flush
-    if !buffer.is_empty() {
-        let _ = flush_buffer(&buffer, &session_path);
     }
 }
 
-fn flush_buffer(buffer: &[LogEvent], path: &PathBuf) -> Result<()> {
-    let mut file = OpenOptions::new()
+fn dump_to_temp(buffer: &[LogEvent], path: &PathBuf) -> Result<()> {
+    let file = OpenOptions::new()
         .create(true)
-        .append(true)
-        .open(path)
-        .context("Failed to open session file")?;
+        .write(true)
+        .truncate(true)
+        .open(path)?;
+    let mut writer = BufWriter::new(file);
+    serde_json::to_writer(&mut writer, buffer)?;
+    Ok(())
+}
 
-    for event in buffer {
-        let json = serde_json::to_string(event)?;
-        writeln!(file, "{}", json)?;
-    }
+fn save_signed_session(buffer: &[LogEvent], path: &PathBuf) -> Result<()> {
+    // 1. Create Payload
+    let payload_json = serde_json::to_string(buffer)?;
+    
+    // 2. Calculate Hash
+    // Hash = SHA256( payload_json + SALT )
+    let mut hasher = Sha256::new();
+    hasher.update(&payload_json);
+    hasher.update(SALT);
+    let result = hasher.finalize();
+    let signature = hex::encode(result);
+
+    // 3. Create Signed Struct
+    let session = SignedSession {
+        header: Header {
+            version: "1.0".to_string(),
+            algorithm: "HMAC-SHA256".to_string(),
+        },
+        payload: buffer.to_vec(),
+        signature,
+    };
+
+    // 4. Write to file
+    let file = File::create(path)?;
+    let mut writer = BufWriter::new(file);
+    serde_json::to_writer_pretty(&mut writer, &session)?; // Pretty print for "official" look
+    
     Ok(())
 }
